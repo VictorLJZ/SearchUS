@@ -30,6 +30,12 @@ image_list = []
 # Cache to store loaded GeoDataFrames to prevent reloading
 gdf_cache = {}
 
+# Credit monitoring settings
+MAX_API_COST = 200.0  # Maximum budget in USD
+COST_PER_IMAGE = 0.007  # Cost per Street View image request
+current_cost = 0.0  # Track current spending
+api_requests_made = 0  # Track number of API requests
+
 # Load only Region 1 countries
 regions_to_countries_dict = {
     "Region 1": ["United States of America", "Canada"]
@@ -39,6 +45,75 @@ regions_to_countries_dict = {
 region_shp_paths = {
     "Region 1": './GRIP4/GRIP4_Region1_vector_shp/GRIP4_region1.shp'
 }
+
+def check_credit_limit():
+    """
+    Checks if we're approaching the credit limit and returns remaining budget.
+    """
+    global current_cost, api_requests_made
+    
+    remaining_budget = MAX_API_COST - current_cost
+    remaining_images = int(remaining_budget / COST_PER_IMAGE)
+    
+    print(f"Credit Status:")
+    print(f"  Current cost: ${current_cost:.2f}")
+    print(f"  Remaining budget: ${remaining_budget:.2f}")
+    print(f"  Remaining images: {remaining_images}")
+    print(f"  API requests made: {api_requests_made}")
+    
+    if remaining_budget < COST_PER_IMAGE:
+        print("⚠️  WARNING: Insufficient credits for even one more image!")
+        return False
+    
+    if remaining_budget < 10.0:
+        print("⚠️  WARNING: Less than $10 remaining!")
+    
+    return True
+
+def load_cost_tracking():
+    """
+    Loads previous cost tracking from file if it exists.
+    """
+    global current_cost, api_requests_made
+    
+    cost_file = "api_cost_tracking.txt"
+    if os.path.exists(cost_file):
+        try:
+            with open(cost_file, 'r') as f:
+                data = f.read().strip().split(',')
+                current_cost = float(data[0])
+                api_requests_made = int(data[1])
+            print(f"Loaded previous cost tracking: ${current_cost:.2f}, {api_requests_made} requests")
+        except (ValueError, IndexError):
+            print("Could not load previous cost tracking, starting fresh")
+            current_cost = 0.0
+            api_requests_made = 0
+    else:
+        print("No previous cost tracking found, starting fresh")
+        current_cost = 0.0
+        api_requests_made = 0
+
+def save_cost_tracking():
+    """
+    Saves current cost tracking to file.
+    """
+    global current_cost, api_requests_made
+    
+    cost_file = "api_cost_tracking.txt"
+    try:
+        with open(cost_file, 'w') as f:
+            f.write(f"{current_cost},{api_requests_made}")
+        print(f"Saved cost tracking: ${current_cost:.2f}, {api_requests_made} requests")
+    except Exception as e:
+        print(f"Error saving cost tracking: {e}")
+
+def update_cost_tracking():
+    """
+    Updates the cost tracking after each successful API request.
+    """
+    global current_cost, api_requests_made
+    current_cost += COST_PER_IMAGE
+    api_requests_made += 1
 
 def check_existing_images(save_dir):
     """
@@ -158,6 +233,11 @@ def GetStreetLL(Lat, Lon, Head, SaveLoc, existing_coords, retries=3):
     if (Lat, Lon) in existing_coords:
         return None, 0  # Skip duplicate location
     
+    # Check credit limit before making API request
+    if not check_credit_limit():
+        print("🚫 Stopping due to credit limit reached!")
+        return None, 0
+    
     # Construct the base URL for fetching the Street View image
     base = r"https://maps.googleapis.com/maps/api/streetview"
     size = r"?size=640x640&fov=90&pitch=0&location="  # Improved settings
@@ -175,6 +255,8 @@ def GetStreetLL(Lat, Lon, Head, SaveLoc, existing_coords, retries=3):
                     # Construct the filename and save the image
                     filename = f"{lat}_{lon}_{int(Head)}.jpg"
                     urllib.request.urlretrieve(MyUrl, os.path.join(SaveLoc, filename))
+                    # Update cost tracking after successful download
+                    update_cost_tracking()
                     return [(date, pano_id, lat, lon, filename), 1]
         except urllib.error.HTTPError as e:
             # Handle HTTP errors and retry after a delay
@@ -205,12 +287,25 @@ def download_images_from_country(country_name, total_images_to_download, save_di
     existing_coords = check_existing_images(save_dir)
     print(f"Found {len(existing_coords)} existing locations, skipping duplicates...")
     
+    # Calculate maximum images we can afford with remaining credits
+    remaining_budget = MAX_API_COST - current_cost
+    max_affordable_images = int(remaining_budget / COST_PER_IMAGE)
+    max_images_for_country = min(total_images_to_download * 4, max_affordable_images)
+    
+    print(f"Budget check: Can afford {max_affordable_images} more images")
+    print(f"Target: {total_images_to_download * 4} images for this country")
+    print(f"Will download: {max_images_for_country} images")
+    
+    if max_images_for_country <= 0:
+        print("🚫 Insufficient credits to download any images!")
+        return
+    
     # Load the shapefile containing the road geometries for the country
     gdf = load_shapefile_for_country(country_name)
     images_downloaded = 0
 
-    # Continue downloading images until the required number of images is reached
-    while images_downloaded < total_images_to_download * 4:
+    # Continue downloading images until the required number of images is reached or credit limit hit
+    while images_downloaded < max_images_for_country:
         n2d = total_images_to_download - int(images_downloaded / 4)
         data_list = generate_ll_systematic(gdf, n2d, spacing_meters=50)  # 50m spacing for better coverage
 
@@ -236,6 +331,11 @@ def download_images_from_country(country_name, total_images_to_download, save_di
 
                         if image_metadata:
                             image_list.append(image_metadata)
+                            
+                        # Check if we've hit our budget limit
+                        if images_downloaded >= max_images_for_country:
+                            print(f"🏁 Reached budget limit of {max_images_for_country} images")
+                            break
                 except Exception as e:
                     print(f"Error downloading image: {e}")
 
@@ -245,9 +345,17 @@ def main():
     """
     Main function that starts the scraping process for US/Canada only.
     """
-    global image_list
+    global image_list, current_cost, api_requests_made
     image_list = []
     DownLoc = "./Downloads"
+
+    # Load previous cost tracking
+    load_cost_tracking()
+    
+    # Show initial credit status
+    print("=== Google Maps API Credit Monitor ===")
+    check_credit_limit()
+    print()
 
     # Scrape an individual country (US or Canada)
     country_name = input("What country would you like to scrape (United States of America or Canada): ")
@@ -267,6 +375,14 @@ def main():
     except Exception as e:
         print(f"Error scraping images: {e}")
     print(f"Scrape completed for {country_name}\n")
+
+    # Show final credit status
+    print("=== Final Credit Status ===")
+    check_credit_limit()
+    print()
+
+    # Save cost tracking
+    save_cost_tracking()
 
     # Save metadata to CSV
     if image_list:
