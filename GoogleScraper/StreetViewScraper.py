@@ -23,7 +23,7 @@ if not key:
     raise ValueError("MAPS_API_KEY not found in .env file")
 
 scrape_type = 0
-samples_per_country = 5
+samples_per_country = 5000
 pano = True
 num_workers = 8  # M1 Pro optimal
 image_list = []
@@ -36,10 +36,8 @@ COST_PER_IMAGE = 0.007  # Cost per Street View image request
 current_cost = 0.0  # Track current spending
 api_requests_made = 0  # Track number of API requests
 
-# Load only Region 1 countries
-regions_to_countries_dict = {
-    "Region 1": ["United States of America", "Canada"]
-}
+# Hardcoded for USA only
+COUNTRY_NAME = "United States of America"
 
 # Dictionary to map regions to shapefiles
 region_shp_paths = {
@@ -164,25 +162,21 @@ def generate_ll_systematic(gdf, n2d=200, spacing_meters=100):
     
     return ll_list
 
-def load_shapefile_for_country(country):
+def load_shapefile_for_country():
     """
-    Loads the shapefile for Region 1 (US and Canada only).
+    Loads the shapefile for USA (Region 1).
     """
-    # Check if country is in Region 1
-    if country in regions_to_countries_dict["Region 1"]:
-        # If region is cached, use the cached GeoDataFrame
-        if "Region 1" in gdf_cache:
-            print(f"Using cached GeoDataFrame for Region 1")
-            return gdf_cache["Region 1"]
-        else:
-            # Load the shapefile for Region 1 and cache it
-            shapefile_path = region_shp_paths["Region 1"]
-            print(f"Loading shapefile for Region 1: {shapefile_path}")
-            gdf = read_dataframe(shapefile_path)
-            gdf_cache["Region 1"] = gdf
-            return gdf
+    # If region is cached, use the cached GeoDataFrame
+    if "Region 1" in gdf_cache:
+        print(f"Using cached GeoDataFrame for Region 1")
+        return gdf_cache["Region 1"]
     else:
-        raise ValueError(f"{country} not found in Region 1. Only US and Canada are supported.")
+        # Load the shapefile for Region 1 and cache it
+        shapefile_path = region_shp_paths["Region 1"]
+        print(f"Loading shapefile for Region 1: {shapefile_path}")
+        gdf = read_dataframe(shapefile_path)
+        gdf_cache["Region 1"] = gdf
+        return gdf
 
 
 # The following function is adapted from Street_View_API_scraping https://github.com/BLorenzoF/Street_View_API_scraping.git
@@ -271,13 +265,12 @@ def GetStreetLL(Lat, Lon, Head, SaveLoc, existing_coords, retries=3):
     return None, 0
 
 
-def download_images_from_country(country_name, total_images_to_download, save_dir):
+def download_images_from_country(total_images_to_download, save_dir):
     """
-    Downloads images from Google Street View for a given country.
+    Downloads images from Google Street View for USA.
 
     Parameters:
-        country_name (str): The name of the country to scrape images from.
-        total_images_to_download (int): The total number of images to download for the country.
+        total_images_to_download (int): The total number of images to download.
         save_dir (str): The directory where the images will be saved.
 
     Returns:
@@ -293,15 +286,15 @@ def download_images_from_country(country_name, total_images_to_download, save_di
     max_images_for_country = min(total_images_to_download * 4, max_affordable_images)
     
     print(f"Budget check: Can afford {max_affordable_images} more images")
-    print(f"Target: {total_images_to_download * 4} images for this country")
+    print(f"Target: {total_images_to_download * 4} images for USA")
     print(f"Will download: {max_images_for_country} images")
     
     if max_images_for_country <= 0:
         print("🚫 Insufficient credits to download any images!")
         return
     
-    # Load the shapefile containing the road geometries for the country
-    gdf = load_shapefile_for_country(country_name)
+    # Load the shapefile containing the road geometries for USA
+    gdf = load_shapefile_for_country()
     images_downloaded = 0
 
     # Continue downloading images until the required number of images is reached or credit limit hit
@@ -322,7 +315,7 @@ def download_images_from_country(country_name, total_images_to_download, save_di
 
             # Process the results from the threads
             for future in tqdm(as_completed(futures), total=len(futures),
-                               desc=f'Downloading Images from {country_name}'):
+                               desc=f'Downloading Images from USA'):
                 try:
                     result = future.result()
                     if result:
@@ -339,11 +332,11 @@ def download_images_from_country(country_name, total_images_to_download, save_di
                 except Exception as e:
                     print(f"Error downloading image: {e}")
 
-    print(f"Downloaded {images_downloaded} images from {country_name}.")
+    print(f"Downloaded {images_downloaded} images from USA.")
 
 def main():
     """
-    Main function that starts the scraping process for US/Canada only.
+    Main function that starts the scraping process for USA only.
     """
     global image_list, current_cost, api_requests_made
     image_list = []
@@ -357,24 +350,18 @@ def main():
     check_credit_limit()
     print()
 
-    # Scrape an individual country (US or Canada)
-    country_name = input("What country would you like to scrape (United States of America or Canada): ")
-    
-    if country_name not in ["United States of America", "Canada"]:
-        print("Error: Only United States of America and Canada are supported.")
-        return
-        
-    print(f"Starting scrape for {country_name}")
-    country_dir = os.path.join(DownLoc, country_name)
+    # Hardcoded for USA
+    print(f"Starting scrape for {COUNTRY_NAME}")
+    country_dir = os.path.join(DownLoc, COUNTRY_NAME)
     if not os.path.exists(country_dir):
         os.mkdir(country_dir)
         print(f'Created dir: {country_dir}\n')
 
     try:
-        download_images_from_country(country_name, total_images_to_download=samples_per_country, save_dir=country_dir)
+        download_images_from_country(total_images_to_download=samples_per_country, save_dir=country_dir)
     except Exception as e:
         print(f"Error scraping images: {e}")
-    print(f"Scrape completed for {country_name}\n")
+    print(f"Scrape completed for {COUNTRY_NAME}\n")
 
     # Show final credit status
     print("=== Final Credit Status ===")
