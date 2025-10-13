@@ -1,0 +1,6 @@
+cohere
+pillow
+pinecone-client
+python-dotenv
+tqdm
+
