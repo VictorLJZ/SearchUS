@@ -1,6 +1,6 @@
 cohere
 pillow
-pinecone-client
+pinecone
 python-dotenv
 tqdm
 

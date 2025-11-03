@@ -6,7 +6,39 @@ import cohere
 from pinecone import Pinecone
 from dotenv import load_dotenv
 
-from embed_images import image_to_data_uri
+
+# function to convert image to data URI
+def image_to_data_uri(image_path):
+    img = Image.open(image_path)
+    
+    # Convert RGBA to RGB if necessary (JPEG doesn't support transparency)
+    if img.mode in ('RGBA', 'LA', 'P'):
+        # Create a white background
+        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+        if img.mode == 'P':
+            img = img.convert('RGBA')
+        rgb_img.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+        img = rgb_img
+    elif img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    buffered = BytesIO()
+    img.save(buffered, format="JPEG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/jpeg;base64,{img_str}"
+
+# ------------------------------------------------------------------------------------------------
+# configs
+INDEX_NAME = "san-francisco-streetview"
+TOP_K = 10  # number of results to return
+
+# load environment variables
+load_dotenv()
+
+# initialize clients
+co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+index = pc.Index(INDEX_NAME)
 
 
 # function to search by text
@@ -60,20 +92,6 @@ def search_by_image(image_path, top_k=TOP_K, filter_dict=None):
     )
     
     return results
-
-
-# ------------------------------------------------------------------------------------------------
-# configs
-INDEX_NAME = "street-view-images"
-TOP_K = 10  # number of results to return
-
-# load environment variables
-load_dotenv()
-
-# initialize clients
-co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index = pc.Index(INDEX_NAME)
 
 
 # function to print results

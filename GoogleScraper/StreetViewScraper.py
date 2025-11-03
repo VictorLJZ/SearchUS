@@ -23,21 +23,22 @@ if not key:
     raise ValueError("MAPS_API_KEY not found in .env file")
 
 scrape_type = 0
-samples_per_country = 5000
+samples_per_country = 10000  # Process all roads (will be capped by MAX_IMAGES)
 pano = True
+MAX_IMAGES = 40000  # Maximum total images to download
 num_workers = 8  # M1 Pro optimal
 image_list = []
 # Cache to store loaded GeoDataFrames to prevent reloading
 gdf_cache = {}
 
 # Credit monitoring settings
-MAX_API_COST = 200.0  # Maximum budget in USD
+MAX_API_COST = 400.0  # Maximum budget in USD (increased to allow 40k images)
 COST_PER_IMAGE = 0.007  # Cost per Street View image request
 current_cost = 0.0  # Track current spending
 api_requests_made = 0  # Track number of API requests
 
-# Hardcoded for USA only
-COUNTRY_NAME = "United States of America"
+# Hardcoded for San Francisco
+COUNTRY_NAME = "San Francisco"
 
 # Dictionary to map regions to shapefiles
 region_shp_paths = {
@@ -131,25 +132,53 @@ def check_existing_images(save_dir):
                         continue
     return existing_coords
 
-def generate_ll_systematic(gdf, n2d=200, spacing_meters=100):
+def generate_ll_systematic(gdf, n2d=200, spacing_meters=100, sampled_road_indices=None):
     """
     Generates coordinates with systematic sampling every X meters along roads.
+    
+    Parameters:
+        gdf: GeoDataFrame with road geometries
+        n2d: Number of locations to generate
+        spacing_meters: Spacing between points along roads
+        sampled_road_indices: Set of road indices already sampled (to avoid repeats)
+    
+    Returns:
+        tuple: (list of coordinates, set of sampled road indices)
     """
+    if sampled_road_indices is None:
+        sampled_road_indices = set()
+    
     ll_list = []
     n_roads = int(n2d / 2)
     
-    # Sample roads systematically
-    roads = gdf.sample(n=n_roads) if len(gdf) > n_roads else gdf
+    # Get roads we haven't sampled yet
+    available_roads = gdf[~gdf.index.isin(sampled_road_indices)]
     
-    for road in roads['geometry']:
-        if road.geom_type == 'LineString':
+    if len(available_roads) == 0:
+        # All roads sampled, reset and try again with tighter spacing or different approach
+        print(f"⚠️  All {len(gdf)} roads have been sampled. Resetting to sample again...")
+        available_roads = gdf
+        sampled_road_indices.clear()
+        # Optionally reduce spacing to get more points from same roads
+        # But for now, just reset and try again
+    
+    # Sample roads we haven't done yet
+    roads_to_sample = min(n_roads, len(available_roads))
+    roads = available_roads.sample(n=roads_to_sample) if len(available_roads) > roads_to_sample else available_roads
+    
+    # Track which roads we're sampling this round
+    current_sampled = set()
+    
+    for idx, road in roads.iterrows():
+        current_sampled.add(idx)
+        if road['geometry'].geom_type == 'LineString':
             # Sample points along the entire road at regular intervals
-            road_length = road.length
+            road_length = road['geometry'].length
             num_points = max(1, int(road_length / spacing_meters))
             
             for i in range(num_points):
                 # Interpolate point along the road
-                point = road.interpolate(i * road_length / num_points)
+                point = road['geometry'].interpolate(i * road_length / num_points)
                 lat, lon = point.y, point.x
                 
                 # Add all 4 directions
@@ -160,23 +189,38 @@ def generate_ll_systematic(gdf, n2d=200, spacing_meters=100):
                     (lat, lon, 272)  # West
                 ])
     
-    return ll_list
+    # Update sampled indices
+    sampled_road_indices.update(current_sampled)
+    
+    return ll_list, sampled_road_indices
 
 def load_shapefile_for_country():
     """
-    Loads the shapefile for USA (Region 1).
+    Loads the shapefile for USA (Region 1) and filters to San Francisco bounding box.
     """
     # If region is cached, use the cached GeoDataFrame
     if "Region 1" in gdf_cache:
         print(f"Using cached GeoDataFrame for Region 1")
-        return gdf_cache["Region 1"]
+        gdf = gdf_cache["Region 1"]
     else:
         # Load the shapefile for Region 1 and cache it
         shapefile_path = region_shp_paths["Region 1"]
         print(f"Loading shapefile for Region 1: {shapefile_path}")
         gdf = read_dataframe(shapefile_path)
         gdf_cache["Region 1"] = gdf
-        return gdf
+    
+    # Define San Francisco bounding box
+    # Format: (min_lon, min_lat, max_lon, max_lat)
+    sf_bounds = (-122.52, 37.70, -122.35, 37.83)
+    
+    # Filter to San Francisco using coordinate-based indexing
+    # cx[min_x:max_x, min_y:max_y] - note x=lon, y=lat
+    sf_gdf = gdf.cx[sf_bounds[0]:sf_bounds[2], sf_bounds[1]:sf_bounds[3]]
+    
+    print(f"Filtered to {len(sf_gdf)} road segments in San Francisco")
+    print(f"Original dataset had {len(gdf)} road segments")
+    
+    return sf_gdf
 
 
 # The following function is adapted from Street_View_API_scraping https://github.com/BLorenzoF/Street_View_API_scraping.git
@@ -267,7 +311,7 @@ def GetStreetLL(Lat, Lon, Head, SaveLoc, existing_coords, retries=3):
 
 def download_images_from_country(total_images_to_download, save_dir):
     """
-    Downloads images from Google Street View for USA.
+    Downloads images from Google Street View for San Francisco.
 
     Parameters:
         total_images_to_download (int): The total number of images to download.
@@ -276,46 +320,88 @@ def download_images_from_country(total_images_to_download, save_dir):
     Returns:
         None
     """
-    # Check existing images to avoid duplicates
+    # Check existing images to avoid duplicates BEFORE starting
     existing_coords = check_existing_images(save_dir)
     print(f"Found {len(existing_coords)} existing locations, skipping duplicates...")
     
     # Calculate maximum images we can afford with remaining credits
     remaining_budget = MAX_API_COST - current_cost
     max_affordable_images = int(remaining_budget / COST_PER_IMAGE)
-    max_images_for_country = min(total_images_to_download * 4, max_affordable_images)
+    
+    # Apply all limits: budget, user-defined max, and theoretical max
+    max_images_for_country = min(MAX_IMAGES, max_affordable_images)
     
     print(f"Budget check: Can afford {max_affordable_images} more images")
-    print(f"Target: {total_images_to_download * 4} images for USA")
-    print(f"Will download: {max_images_for_country} images")
+    print(f"Max images limit: {MAX_IMAGES}")
+    print(f"Will download up to: {max_images_for_country} images")
     
     if max_images_for_country <= 0:
         print("🚫 Insufficient credits to download any images!")
         return
     
-    # Load the shapefile containing the road geometries for USA
+    # Load the shapefile containing the road geometries for San Francisco
     gdf = load_shapefile_for_country()
     images_downloaded = 0
+    sampled_road_indices = set()  # Track which roads we've already sampled
+    current_spacing = 150  # Start with 150m spacing
 
     # Continue downloading images until the required number of images is reached or credit limit hit
     while images_downloaded < max_images_for_country:
+        # Check limit BEFORE generating batch to avoid wasting API calls
+        remaining_images = max_images_for_country - images_downloaded
+        if remaining_images <= 0:
+            print(f"🏁 Reached limit of {max_images_for_country} images")
+            break
+        
+        # Check budget before proceeding
+        if not check_credit_limit():
+            print("🚫 Stopping due to credit limit reached!")
+            break
+        
+        # If we've sampled all roads, reduce spacing to get more points from same roads
+        if len(sampled_road_indices) >= len(gdf) * 0.9:  # 90% of roads sampled
+            if current_spacing > 50:
+                new_spacing = max(50, current_spacing - 25)
+                print(f"⚠️  Most roads sampled. Reducing spacing from {current_spacing}m to {new_spacing}m")
+                current_spacing = new_spacing
+                sampled_road_indices.clear()  # Reset to sample same roads with tighter spacing
+        
         n2d = total_images_to_download - int(images_downloaded / 4)
-        data_list = generate_ll_systematic(gdf, n2d, spacing_meters=50)  # 50m spacing for better coverage
+        data_list, sampled_road_indices = generate_ll_systematic(
+            gdf, n2d, spacing_meters=current_spacing, sampled_road_indices=sampled_road_indices
+        )
+        
+        if len(sampled_road_indices) > 0:
+            print(f"Progress: Sampled {len(sampled_road_indices)}/{len(gdf)} roads, {len(data_list)} coordinates generated")
 
         if not data_list:
             print("No points generated, exiting.")
             break
 
+        # Filter out duplicates BEFORE submitting to thread pool (much faster)
+        filtered_data_list = [
+            (lat, lon, head) for lat, lon, head in data_list 
+            if (lat, lon) not in existing_coords
+        ]
+        
+        print(f"Generated {len(data_list)} coordinates, {len(filtered_data_list)} are new (skipping {len(data_list) - len(filtered_data_list)} duplicates)")
+        
+        if not filtered_data_list:
+            print("All coordinates are duplicates, trying next batch...")
+            continue
+
         # Use a thread pool to download images concurrently
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = [
                 executor.submit(GetStreetLL, i[0], i[1], i[2], save_dir, existing_coords)
-                for i in data_list
+                for i in filtered_data_list
             ]
 
             # Process the results from the threads
+            successful_downloads = 0
+            failed_downloads = 0
             for future in tqdm(as_completed(futures), total=len(futures),
-                               desc=f'Downloading Images from USA'):
+                               desc=f'Downloading ({images_downloaded}/{max_images_for_country})'):
                 try:
                     result = future.result()
                     if result:
@@ -323,20 +409,40 @@ def download_images_from_country(total_images_to_download, save_dir):
                         images_downloaded += images_downloaded_in_current_iteration
 
                         if image_metadata:
+                            successful_downloads += 1
                             image_list.append(image_metadata)
+                            # Add coordinates to existing set to avoid duplicates within same run
+                            lat, lon = image_metadata[2], image_metadata[3]
+                            existing_coords.add((lat, lon))
+                        else:
+                            failed_downloads += 1
                             
-                        # Check if we've hit our budget limit
+                        # Check if we've hit our limit (check immediately after increment)
                         if images_downloaded >= max_images_for_country:
-                            print(f"🏁 Reached budget limit of {max_images_for_country} images")
+                            print(f"🏁 Reached limit of {max_images_for_country} images")
                             break
+                            
+                        # Also check budget after each successful download
+                        if not check_credit_limit():
+                            print("🚫 Stopping due to credit limit reached!")
+                            break
+                    else:
+                        failed_downloads += 1
                 except Exception as e:
+                    failed_downloads += 1
                     print(f"Error downloading image: {e}")
+                
+                # Break out of inner loop if limit reached
+                if images_downloaded >= max_images_for_country:
+                    break
+            
+            print(f"Batch complete: {successful_downloads} successful, {failed_downloads} failed, {images_downloaded} total downloaded")
 
-    print(f"Downloaded {images_downloaded} images from USA.")
+    print(f"Downloaded {images_downloaded} images from San Francisco.")
 
 def main():
     """
-    Main function that starts the scraping process for USA only.
+    Main function that starts the scraping process for San Francisco.
     """
     global image_list, current_cost, api_requests_made
     image_list = []
@@ -350,7 +456,7 @@ def main():
     check_credit_limit()
     print()
 
-    # Hardcoded for USA
+    # Scraping San Francisco
     print(f"Starting scrape for {COUNTRY_NAME}")
     country_dir = os.path.join(DownLoc, COUNTRY_NAME)
     if not os.path.exists(country_dir):
